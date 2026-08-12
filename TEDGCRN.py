@@ -17,19 +17,21 @@ class SpectralFilter(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, N, T, D]
+        # 输入维度为[批次, 节点, 时间步, 特征]
         B, N, T, D = x.shape
 
-        x_fft = torch.fft.rfft(x, dim=2, norm='ortho')  # [B, N, F, D]
+        # 沿时间维做傅里叶变换
+        x_fft = torch.fft.rfft(x, dim=2, norm='ortho')
 
-        weight = torch.view_as_complex(self.complex_weight)  # [D, F]
-        weight = weight.permute(1, 0).unsqueeze(0).unsqueeze(0)  # [1, 1, F, D]
+        weight = torch.view_as_complex(self.complex_weight)
+        weight = weight.permute(1, 0).unsqueeze(0).unsqueeze(0)
         x_fft = x_fft * weight
 
         amplitude = x_fft.abs()
-        amp_energy = amplitude.mean(dim=-1)  # [B, N, F]
+        amp_energy = amplitude.mean(dim=-1)
 
-        mask = self.amp_gate(amp_energy).unsqueeze(-1)  # [B, N, F, 1]
+        # 根据频谱能量调整各频率分量的权重
+        mask = self.amp_gate(amp_energy).unsqueeze(-1)
         x_fft = x_fft * mask.to(x_fft.dtype)
 
         return torch.fft.irfft(x_fft, n=T, dim=2, norm='ortho')
@@ -49,9 +51,9 @@ class MultiScaleConv1D(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x):
-        # x: [B, N, T, D]
+        # 将每个节点的时间序列单独送入一维卷积
         B, N, T, D = x.shape
-        x_in = x.reshape(B * N, T, D).permute(0, 2, 1)  # [B*N, D, T]
+        x_in = x.reshape(B * N, T, D).permute(0, 2, 1)
 
         x_in = self.proj_in(x_in)
 
@@ -81,22 +83,23 @@ class AdvancedTemporalBlock(nn.Module):
         self.dropout = nn.Dropout(drop)
 
     def forward(self, x):
-        # x: [B, T, N, D_in]
+        # 先统一特征维度，再交换节点和时间维
         x = self.input_proj(x)
-        x = x.permute(0, 2, 1, 3)  # [B, N, T, D_hidden]
+        x = x.permute(0, 2, 1, 3)
 
         residual = x
 
         feat_freq = self.freq_module(x)
         feat_time = self.time_module(x)
 
+        # 门控融合时域和频域特征
         combined = torch.cat([feat_time, feat_freq], dim=-1)
         gate = torch.sigmoid(self.fusion_gate(combined))
         fused = feat_time * gate + feat_freq * (1 - gate)
 
         x = residual + self.dropout(fused)
         x = self.norm(x)
-        return x.permute(0, 2, 1, 3)  # [B, T, N, D_hidden]
+        return x.permute(0, 2, 1, 3)
 
 
 class TEDGCRNEncoder(nn.Module):
@@ -112,32 +115,27 @@ class TEDGCRNEncoder(nn.Module):
             self.cells.append(TEDGCRNCell(node_num, dim_out, dim_out, cheb_k, embed_dim, time_dim))
 
     def forward(self, x, init_state, node_embeddings):
-        #shape of x: (B, T, N, D)
-        #shape of init_state: (num_layers, B, N, hidden_dim)
+        # x为[B,T,N,D]，init_state保存每一层的初始状态
         assert x.shape[2] == self.node_num and x.shape[3] == self.input_dim
-        seq_length = x.shape[1]     #x=[batch,steps,nodes,input_dim]
+        seq_length = x.shape[1]
         current_inputs = x
         output_hidden = []
         for i in range(self.num_layers):
-            state = init_state[i]   #state=[batch,steps,nodes,input_dim]
+            state = init_state[i]
             inner_states = []
-            for t in range(seq_length):   #如果有两层GRU，则第二层的GGRU的输入是前一层的隐藏状态
-                state = self.cells[i](current_inputs[:, t, :, :], state, [node_embeddings[0][:, t, :], node_embeddings[1][:, t, :], node_embeddings[2]])#state=[batch,steps,nodes,input_dim]
-                # state = self.dcrnn_cells[i](current_inputs[:, t, :, :], state,[node_embeddings[0], node_embeddings[1]])
-                inner_states.append(state)   #一个list，里面是每一步的GRU的hidden状态
-            output_hidden.append(state)  #每层最后一个GRU单元的hidden状态
+            for t in range(seq_length):
+                state = self.cells[i](current_inputs[:, t, :, :], state, [node_embeddings[0][:, t, :], node_embeddings[1][:, t, :], node_embeddings[2]])
+                inner_states.append(state)
+            output_hidden.append(state)
             current_inputs = torch.stack(inner_states, dim=1)
-            #拼接成完整的上一层GRU的hidden状态，作为下一层GRRU的输入[batch,steps,nodes,hiddensize]
-        #current_inputs: the outputs of last layer: (B, T, N, hidden_dim)
-        #output_hidden: the last state for each layer: (num_layers, B, N, hidden_dim)
-        #last_state: (B, N, hidden_dim)
+            # 当前层的完整隐藏序列会作为下一层输入
         return current_inputs, output_hidden
 
     def init_hidden(self, batch_size):
         init_states = []
         for i in range(self.num_layers):
             init_states.append(self.cells[i].init_hidden_state(batch_size))
-        return torch.stack(init_states, dim=0)      #(num_layers, B, N, hidden_dim)
+        return torch.stack(init_states, dim=0)
 
 
 class TEDGCRNDecoder(nn.Module):
@@ -153,8 +151,7 @@ class TEDGCRNDecoder(nn.Module):
             self.cells.append(TEDGCRNCell(node_num, dim_out, dim_out, cheb_k, embed_dim, time_dim))
 
     def forward(self, xt, init_state, node_embeddings):
-        # xt: (B, N, D)
-        # init_state: (num_layers, B, N, hidden_dim)
+        # 每一步都用上一时刻预测和隐藏状态继续解码
         assert xt.shape[1] == self.node_num and xt.shape[2] == self.input_dim
         current_inputs = xt
         output_hidden = []
@@ -187,7 +184,7 @@ class TEDGCRN(nn.Module):
                                        args.embed_dim, args.time_dim, args.num_layers)
         self.decoder = TEDGCRNDecoder(args.num_nodes, args.output_dim, args.rnn_units, args.cheb_k,
                                        args.embed_dim, args.time_dim, args.num_layers)
-        #predictor
+        # 将隐藏状态映射成最终预测值
         self.proj = nn.Sequential(nn.Linear(self.hidden_dim, self.output_dim, bias=True))
         fft_len = args.lag // 2 + 1
         self.temporal_enhance = AdvancedTemporalBlock(
@@ -200,7 +197,7 @@ class TEDGCRN(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize standard layers without overwriting spectral filters."""
+        """初始化常用层，同时保留频域滤波器自己的初始化方式。"""
         for module in self.modules():
             if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
                 nn.init.xavier_uniform_(module.weight)
@@ -219,15 +216,11 @@ class TEDGCRN(nn.Module):
         nn.init.xavier_uniform_(self.D_i_W_emb2)
 
     def forward(self, source, traget=None, batches_seen=None):
-        #source: B, T_1, N, D
-        #target: B, T_2, N, D
-
-
+        # source和target中除了流量，还包含时刻和星期信息
         source_raw = source
         target_raw = traget
         t_i_d_data1 = source_raw[..., 0, -2]
         t_i_d_data2 = target_raw[..., 0, -2]
-        # T_i_D_emb = self.T_i_D_emb[(t_i_d_data[:, -1, :] * 288).type(torch.LongTensor)]
         T_i_D_emb1_en = self.T_i_D_emb1[(t_i_d_data1 * 288).type(torch.LongTensor)]
         T_i_D_emb2_en = self.T_i_D_emb2[(t_i_d_data1 * 288).type(torch.LongTensor)]
 
@@ -236,7 +229,6 @@ class TEDGCRN(nn.Module):
         if self.use_W:
             d_i_w_data1 = source_raw[..., 0, -1]
             d_i_w_data2 = target_raw[..., 0, -1]
-            # D_i_W_emb = self.D_i_W_emb[(d_i_w_data[:, -1, :]).type(torch.LongTensor)]
             D_i_W_emb1_en = self.D_i_W_emb1[(d_i_w_data1).type(torch.LongTensor)]
             D_i_W_emb2_en = self.D_i_W_emb2[(d_i_w_data1).type(torch.LongTensor)]
 
@@ -259,13 +251,11 @@ class TEDGCRN(nn.Module):
         en_node_embeddings=[node_embedding_en1, node_embedding_en2, self.node_embeddings1]
 
         source_value = source_raw[..., :self.input_dim]
-        # Temporal enhancement is an intrinsic part of TEDGCRN. Its output
-        # enters each encoder cell and therefore participates directly in
-        # both sample-specific graph generation and recurrent prediction.
+        # 增强后的流量特征直接送入编码器，并参与动态图生成
         source = self.temporal_enhance(source_value)
 
-        init_state = self.encoder.init_hidden(source.shape[0]).to(source.device)  # [2,64,307,64] 前面是2是因为有两层GRU
-        state, _ = self.encoder(source, init_state, en_node_embeddings)  # B, T, N, hidden
+        init_state = self.encoder.init_hidden(source.shape[0]).to(source.device)
+        state, _ = self.encoder(source, init_state, en_node_embeddings)
         state = state[:, -1:, :, :].squeeze(1)
 
         ht_list = [state] * self.num_layers
@@ -276,9 +266,10 @@ class TEDGCRN(nn.Module):
             state, ht_list = self.decoder(go, ht_list, [node_embedding_de1[:, t, :], node_embedding_de2[:, t, :], self.node_embeddings1])
             go = self.proj(state)
             out.append(go)
-            if self.training:     #这里的课程学习用了给予一定概率用真实值代替预测值来学习的教师-学生学习法（名字忘了，大概跟着有关）
+            # 训练时按课程学习概率决定是否使用真实值
+            if self.training:
                 c = np.random.uniform(0, 1)
-                if c < self._compute_sampling_threshold(batches_seen):  #如果满足条件，则用真实值代替预测值训练
+                if c < self._compute_sampling_threshold(batches_seen):
                     go = traget[:, t, :, 0].unsqueeze(-1)
         output = torch.stack(out, dim=1)
 
